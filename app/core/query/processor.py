@@ -1,10 +1,18 @@
 import json
-from typing import Dict
+import re
+from typing import Dict, List, Optional
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph
-from agentic_flow_construction import FlowConstructor
+from .agentic_flow import FlowConstructor
 from langchain_openai import ChatOpenAI
-import re
+
+
+class AliasResolutionRequired(Exception):
+    """Raised when user input is needed to choose among alias candidates."""
+
+    def __init__(self, candidates: Dict[str, List[str]]):
+        self.candidates = candidates
+        super().__init__("Alias selection required")
 
 class QueryProcessor:
     def __init__(self, **kwargs):
@@ -529,6 +537,78 @@ Remember to return a JSON object with keys "category" and "explanation" as shown
             if entry == question:
                 return True
         return False
+
+    def _normalize(self, value: str) -> str:
+        return self.flow_constructor.flow_operations.normalize_entity_name(value)
+
+    def _load_alias_dict(self) -> Dict:
+        return self.flow_constructor.flow_operations.load_json(self.flow_constructor.flow_operations.alias_path)
+
+    def _load_graph_dict(self) -> Dict:
+        return self.flow_constructor.flow_operations.load_entity_graph(self.flow_constructor.flow_operations.graph_path)
+
+    def _validate_alias_overrides(self, overrides: Dict[str, str]) -> Dict[str, str]:
+        if not overrides:
+            return {}
+
+        alias_dict = self._load_alias_dict()
+        alias_map = alias_dict.get('abbreviations', {})
+        graph_dict = self._load_graph_dict()
+        graph_keys = {self._normalize(name) for name in graph_dict.keys()}
+
+        validated: Dict[str, str] = {}
+        for alias, selection in overrides.items():
+            normalized_alias = self._normalize(alias)
+            if normalized_alias not in alias_map:
+                raise ValueError(f"Alias override provided for unknown abbreviation '{alias}'")
+
+            possible = {
+                self._normalize(name): name for name in alias_map[normalized_alias]
+            }
+            normalized_selection = self._normalize(selection)
+            if normalized_selection not in possible:
+                raise ValueError(
+                    f"Selection '{selection}' is not a valid expansion for abbreviation '{alias}'"
+                )
+            if normalized_selection not in graph_keys:
+                raise ValueError(
+                    f"Selection '{selection}' for alias '{alias}' is not present in the graph"
+                )
+
+            validated[normalized_alias] = possible[normalized_selection]
+
+        return validated
+
+    def _detect_alias_conflicts(
+        self,
+        question: str,
+        validated_overrides: Dict[str, str],
+    ) -> Dict[str, List[str]]:
+        alias_dict = self._load_alias_dict()
+        alias_map = alias_dict.get('abbreviations', {})
+        graph_dict = self._load_graph_dict()
+        graph_keys = {self._normalize(name) for name in graph_dict.keys()}
+
+        override_keys = set(validated_overrides.keys())
+        tokens = {token for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*", question.upper())}
+
+        conflicts: Dict[str, List[str]] = {}
+        for token in tokens:
+            if token not in alias_map:
+                continue
+            if token in override_keys:
+                continue
+            if token in graph_keys:
+                continue
+
+            valid_full_names = [
+                name for name in alias_map[token]
+                if self._normalize(name) in graph_keys
+            ]
+            if len(valid_full_names) > 1:
+                conflicts[token] = sorted(valid_full_names)
+
+        return conflicts
     
     def write_chunk_to_file(self, question: str, entity_chunks: dict):
         """
@@ -552,33 +632,55 @@ Remember to return a JSON object with keys "category" and "explanation" as shown
         except Exception as e:
             print(f"Error writing chunk to file: {e}")
 
-    async def ask_question(self, question: str) -> Dict:
+    async def ask_question(
+        self,
+        question: str,
+        alias_overrides: Optional[Dict[str, str]] = None,
+    ) -> Dict:
         """
         Ask a question and get entity-based analysis.
-        
+
         Args:
             question (str): The question to analyze
         
         Returns:
             Dict: Analysis results including entities and their information
         """
-        if self.check_if_question_exists(question):
-            return None
-            
+        alias_overrides = alias_overrides or {}
+        validated_overrides = self._validate_alias_overrides(alias_overrides)
+        conflicts = self._detect_alias_conflicts(question, validated_overrides)
+        if conflicts:
+            raise AliasResolutionRequired(conflicts)
+
+        self.flow_constructor.flow_operations.set_alias_overrides(validated_overrides)
+
         chunk = self.find_chunk_for_question(question)
         self.renewd_question = question
         res = await self.process_question_and_chunks(question, chunk)
-        
+
         # Check if we have a valid result
         if not res or len(res) == 0:
-            return "No results were returned for this question."
+            return {
+                "answer": "No results were returned for this question.",
+                "entities_used": [],
+                "entity_chunks": None,
+                "fallback_to_prompt": True,
+                "renewed_question": question,
+            }
         
         last_message = res[-1].get('messages', None)
         if not last_message:
-            return "No message content in the response."
-        
+            return {
+                "answer": "No message content in the response.",
+                "entities_used": [],
+                "entity_chunks": None,
+                "fallback_to_prompt": True,
+                "renewed_question": question,
+            }
+
         content = last_message.content
         flag = False
+        entity_chunks = None
         # Check if the content is an error message
         if content.startswith("No matching entities") or content.startswith("No entities were identified") or content.startswith("No valid entities"):
             # return f"I couldn't find information about the entities in your question. {content}"
@@ -588,13 +690,29 @@ Remember to return a JSON object with keys "category" and "explanation" as shown
             if flag:
                 prompt = f"""{chunk}\n\nYou need to answer the following question as more details as possible based on the provided information above\n Question: {question}"""
                 answer = self.llm.invoke(prompt).content
+                entities = []
             else:
                 entity_chunks = json.loads(content)
                 self.write_chunk_to_file(question, entity_chunks)
                 self.set_renewd_question()
                 print("Renewed question: ", self.renewd_question)
                 answer = self.generate_answer(entity_chunks, self.renewd_question)
-            return answer
+                entities = list(entity_chunks.keys())
+            return {
+                "answer": answer,
+                "entities_used": entities,
+                "entity_chunks": entity_chunks,
+                "fallback_to_prompt": flag,
+                "renewed_question": self.renewd_question if self.renewd_question else question,
+            }
         except json.JSONDecodeError as e:
             print(f"Error parsing JSON: {e}")
-            return f"There was an error processing your question: {str(e)}"
+            return {
+                "answer": f"There was an error processing your question: {str(e)}",
+                "entities_used": [],
+                "entity_chunks": None,
+                "fallback_to_prompt": True,
+                "renewed_question": question,
+            }
+        finally:
+            self.flow_constructor.flow_operations.set_alias_overrides({})

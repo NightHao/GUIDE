@@ -1,14 +1,20 @@
 import json
 import codecs
+from pathlib import Path
+from typing import Optional, Dict
+
+from app.core.config import settings
+
 
 class AliasBuilder:
-    def __init__(self):
-        self.log_file_path = './log.json'
-        self.output_path = './alias_dict.json'
+    def __init__(self, log_file_path: str | None = None, output_path: str | None = None):
+        self.log_file_path = log_file_path or str(settings.INTERMEDIATE_DIR / 'log.json')
+        self.output_path = output_path or str(settings.INTERMEDIATE_DIR / 'alias_dict.json')
 
-    def load_abbr_dict(self):
+    def load_abbr_dict(self, log_file_path: Optional[str] = None) -> Dict[str, list[str]]:
         """Load the abbreviation dictionary from a JSON file."""
-        with codecs.open(self.log_file_path, 'r', encoding='utf-8') as f:
+        path = Path(log_file_path or self.log_file_path)
+        with codecs.open(path, 'r', encoding='utf-8') as f:
             log_data = json.load(f)
         return log_data.get('abbr_dict', {}).get('data', {})
 
@@ -56,7 +62,9 @@ class AliasBuilder:
 
     def save_alias_dict(self, alias_dict):
         """Save the alias dictionary to a JSON file."""
-        with codecs.open(self.output_path, 'w', encoding='utf-8') as f:
+        output_path = Path(self.output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with codecs.open(output_path, 'w', encoding='utf-8') as f:
             json.dump(alias_dict, f, indent=4, ensure_ascii=False)
 
 if __name__ == "__main__":
@@ -65,6 +73,6 @@ if __name__ == "__main__":
     alias_dict = alias_builder.build_alias_dict(abbr_dict)
     alias_builder.save_alias_dict(alias_dict)
     
-    print(f"Alias dictionary created and saved to ./alias_dict.json")
+    print(f"Alias dictionary created and saved to {alias_builder.output_path}")
     print(f"Number of abbreviations: {len(alias_dict['abbreviations'])}")
     print(f"Number of full names: {len(alias_dict['full_names'])}")

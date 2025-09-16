@@ -1,0 +1,38 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Test artifacts
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# Notebooks / scratch
+notebooks/
+scratch/

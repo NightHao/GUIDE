@@ -3,22 +3,29 @@ from dotenv import load_dotenv, find_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.callbacks.tracers.langchain import wait_for_all_tracers
 import os, re, json, asyncio, nest_asyncio, time, numpy as np, pprint, datetime
+from pathlib import Path
+from typing import Optional
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
 from pydantic import BaseModel, Field
 
 class EntityGraphProcessor:
-    def __init__(self):
+    def __init__(self, log_file_path: Optional[str] = None):
         # Find the .env file
         env_path = find_dotenv()
         print(f".env file found at: {env_path}")
         load_dotenv()
         print("Environment variables loaded.")
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+        self.log_file_path = Path(log_file_path) if log_file_path else Path('log.json')
         try:
             self.llm.invoke("Hello, World!")
         finally:
             wait_for_all_tracers()
+
+    def set_log_file_path(self, path: str):
+        """Override the default log file path."""
+        self.log_file_path = Path(path)
 
     def display_env_variables(self, exclude_keys=None):
         """
@@ -39,49 +46,54 @@ class EntityGraphProcessor:
             else:
                 print(f"{key}={value}")
 
-    def load_log(self, file_path: str = 'log.json') -> dict:
+    def load_log(self, file_path: Optional[str] = None) -> dict:
         """
         Loads the log from log.json. Creates empty log if file doesn't exist.
         """
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            path = Path(file_path) if file_path else self.log_file_path
+            with path.open('r', encoding='utf-8') as f:
                 return json.load(f)
         except FileNotFoundError:
             return {}
         except json.JSONDecodeError:
             return {}
 
-    def write_to_log(self, data, step_name: str, file_path: str = 'log.json') -> None:
+    def write_to_log(self, data, step_name: str, file_path: Optional[str] = None) -> None:
         """
         Writes processing outputs to log.json with timestamps.
-        
+
         Args:
             data: The output data to store
             step_name: Name of the processing step (e.g., 'abbreviation_results', 'pattern_clusters')
             file_path: Path to the outputs file
         """
         # Load existing outputs
-        outputs = self.load_log(file_path)
-        
+        path = Path(file_path) if file_path else self.log_file_path
+        outputs = self.load_log(path)
+
         # Add metadata to the output
         output_entry = {
             'data': data,
             'timestamp': datetime.datetime.now().isoformat(),
             'step': step_name
         }
-        
+
         # Update with new data
         outputs[step_name] = output_entry
-        
+
         # Write back to file
-        with open(file_path, 'w', encoding='utf-8') as outfile:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w', encoding='utf-8') as outfile:
             json.dump(outputs, outfile, indent=4, ensure_ascii=False)
 
-    def clear_log(self, file_path: str = 'log.json') -> None:
+    def clear_log(self, file_path: Optional[str] = None) -> None:
         """
         Clears the log by writing an empty dictionary to the file.
         """
-        with open(file_path, 'w', encoding='utf-8') as outfile:
+        path = Path(file_path) if file_path else self.log_file_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w', encoding='utf-8') as outfile:
             json.dump({}, outfile, indent=4, ensure_ascii=False)
 
     def load_entity_graph(self, file_path: str) -> dict:
@@ -674,6 +686,7 @@ class EntityGraphProcessor:
         self.remove_self_loops(processed_graph)
         print(f"After processing: the number of nodes is {len(processed_graph)}")
         self.save_graph(output_graph_file, processed_graph)
+        return processed_graph
 
 if __name__ == "__main__":
     processor = EntityGraphProcessor()

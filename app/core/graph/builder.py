@@ -1,6 +1,7 @@
 import json
 import networkx as nx
 import re
+from pathlib import Path
 from typing import Dict
 
 def clean_str(input_str: str) -> str:
@@ -153,6 +154,33 @@ def convert_graph_to_dict(g: nx.Graph) -> Dict[str, dict]:
             }
             node_entry["connections"].append(connection)
         entity_graph[node] = node_entry
+    return entity_graph
+
+
+def build_entity_graph(
+    entities_file: str,
+    output_path: str,
+    *,
+    tuple_delimiter: str = "<|>",
+    record_delimiter: str = "##",
+    join_descriptions: bool = True,
+) -> Dict[str, dict]:
+    """Build an entity graph dictionary from raw extraction results and persist it."""
+
+    results = load_results(entities_file)
+    graph = process_results(
+        results,
+        tuple_delimiter=tuple_delimiter,
+        record_delimiter=record_delimiter,
+        join_descriptions=join_descriptions,
+    )
+    entity_graph = convert_graph_to_dict(graph)
+
+    output_path_obj = Path(output_path)
+    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    with output_path_obj.open("w", encoding="utf-8") as outfile:
+        json.dump(entity_graph, outfile, indent=4, ensure_ascii=False)
+
     return entity_graph
 
 if __name__ == "__main__":

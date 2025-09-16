@@ -1,6 +1,6 @@
 from dotenv import load_dotenv, find_dotenv
 from collections import deque
-from typing import Dict, List
+from typing import Dict, List, Optional
 from fuzzywuzzy import fuzz, process
 import json, heapq, re, asyncio, logging
 from pydantic import BaseModel
@@ -19,6 +19,9 @@ from langchain_core.messages import (
     AIMessage,
 )
 
+from pathlib import Path
+from app.core.config import settings
+
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
@@ -28,7 +31,9 @@ class FlowOperations:
         load_dotenv()
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
         self.replaced_term = {}
-        self.graph_path = "./optimized_entity_graph.json"
+        self.alias_overrides: Dict[str, str] = {}
+        self.graph_path = Path(settings.DEFAULT_GRAPH_PATH)
+        self.alias_path = settings.INTERMEDIATE_DIR / "alias_dict.json"
 
         try:
             self.llm.invoke("Hello, World!")
@@ -43,7 +48,19 @@ class FlowOperations:
         self.replaced_term[entity_name] = validated_entity_name
 
     def set_graph_path(self, path: str):
-        self.graph_path = path
+        self.graph_path = Path(path)
+
+    def set_alias_overrides(self, overrides: Optional[Dict[str, str]] = None) -> None:
+        """Register preferred expansions for abbreviations."""
+
+        self.alias_overrides = {}
+        if overrides:
+            for key, value in overrides.items():
+                normalized_key = self.normalize_entity_name(key)
+                self.alias_overrides[normalized_key] = value
+
+    def set_alias_path(self, path: str):
+        self.alias_path = Path(path)
 
     def normalize_entity_name(self, name: str) -> str:
         """
@@ -68,7 +85,8 @@ class FlowOperations:
             Dict: The loaded entity graph dictionary.
         """
         try:
-            with open(file_path, 'r') as f:
+            path = Path(file_path)
+            with path.open('r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
             print(f"Error loading entity graph: {e}")
@@ -311,37 +329,13 @@ class FlowOperations:
             Dict: The loaded alias index dictionary
         """
         try:
-            with open(file_path, 'r') as f:
+            path = Path(file_path)
+            with path.open('r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
             print(f"Error loading alias index: {e}")
             return {}
         
-    def ask_user(self, **kwargs):
-        # case 1: confirm fuzzy match
-        if 'match_name' in kwargs and 'original_name' in kwargs:
-            while True:
-                print(f"Did you mean '{kwargs['match_name']}' when you entered '{kwargs['original_name']}'? (Y/N)")
-                user_input = input()
-                if user_input.upper() in ['Y', 'N']:
-                    return kwargs['match_name'] if user_input.upper() == 'Y' else None
-                print("Please enter Y or N")
-        
-        # case 2: multiple full names for abbreviation
-        if 'alias_names' in kwargs:
-            while True:
-                print("Multiple options found. Please choose one:")
-                for i, name in enumerate(kwargs['alias_names'], 1):
-                    print(f"{i}. {name}")
-                try:
-                    choice = int(input("Enter the number of your choice: "))
-                    if 1 <= choice <= len(kwargs['alias_names']):
-                        return kwargs['alias_names'][choice - 1]
-                except ValueError:
-                    print("Please enter a valid number")
-        
-        return None
-
     def check_entity_in_graph(self, entity_name):
         entity_graph = self.load_json(self.graph_path)
         return entity_name in entity_graph.keys()
@@ -366,84 +360,68 @@ class FlowOperations:
         
         return None
 
-    def match_entity_name_with_alias(self, entity_name: str) -> str:
-        """
-        Matches an entity name to the closest entity in the entity graph using the comprehensive logic.
-        
-        Args:
-            query (str): The entity name to match
-            
-        Returns:
-            str: Validated entity name
-        """
+    def match_entity_name_with_alias(self, entity_name: str) -> Optional[str]:
+        """Resolve an entity name using alias rules and optional overrides."""
+
         normalized_entity_name = self.normalize_entity_name(entity_name)
-        alias_dict= self.load_json('./alias_dict.json')
-        # STEP 1: Determine if query is an abbreviation or full name
-        is_abbreviation = normalized_entity_name in alias_dict.get('abbreviations', {})
-        #print("This is the is_abbreviation: ", is_abbreviation)
-        # STEP 2: Process as abbreviation
-        if is_abbreviation:
-            full_names = alias_dict['abbreviations'].get(normalized_entity_name, [])
-            #print("This is the full names: ", full_names)
-            # Check if abbreviation exists directly in graph
+        alias_dict = self.load_json(self.alias_path)
+        alias_map = alias_dict.get('abbreviations', {})
+
+        # Apply user-provided override when available.
+        override_value = self.alias_overrides.get(normalized_entity_name)
+        if override_value:
+            normalized_override = self.normalize_entity_name(override_value)
+            if self.check_entity_in_graph(normalized_override):
+                self.set_replaced_term(entity_name, override_value)
+                return normalized_override
+
+        # Process abbreviation lookups first.
+        if normalized_entity_name in alias_map:
+            full_names = alias_map[normalized_entity_name]
             if self.check_entity_in_graph(normalized_entity_name):
-                if len(full_names) > 1:
-                    chosen_name = self.ask_user(alias_names=full_names)
-                    self.set_replaced_term(entity_name, chosen_name)
-                elif len(full_names) == 1:
+                if len(full_names) == 1:
                     self.set_replaced_term(entity_name, full_names[0])
-                return entity_name
-            
-            # Filter to only full names that exist in the graph
-            valid_full_names = [name for name in full_names if self.check_entity_in_graph(self.normalize_entity_name(name))]
-            
-            if len(valid_full_names) > 1:
-                # Ask user to choose from multiple valid full names
-                chosen_name = self.ask_user(alias_names=valid_full_names)
-                if chosen_name:
-                    self.set_replaced_term(entity_name, chosen_name)
-                    return self.normalize_entity_name(chosen_name)
-            elif len(valid_full_names) == 1:
-                self.set_replaced_term(entity_name, valid_full_names[0])
-                return self.normalize_entity_name(valid_full_names[0])
-        
-        # STEP 3: Process as full name
-        else:
-            # Check if full name exists directly in graph
-            if self.check_entity_in_graph(normalized_entity_name):
                 return normalized_entity_name
-            
-            for abbr, full_names in alias_dict['abbreviations'].items():
-                if normalized_entity_name in [name.strip().upper() for name in full_names]:
-                    # Check if the abbreviation exists in the graph
-                    if self.check_entity_in_graph(abbr):
-                        return abbr
-                    
-                    # Filter to only full names that exist in the graph
-                    valid_full_names = [name for name in full_names if self.check_entity_in_graph(self.normalize_entity_name(name))]
-                    
-                    if len(valid_full_names) > 1:
-                        # Ask user to choose from multiple valid full names
-                        chosen_name = self.ask_user(alias_names=valid_full_names)
-                        if chosen_name:
-                            self.set_replaced_term(entity_name, chosen_name)
-                            return self.normalize_entity_name(chosen_name)
-                    elif len(valid_full_names) == 1:
-                        # Only one valid full name exists
-                        self.set_replaced_term(entity_name, valid_full_names[0])
-                        return self.normalize_entity_name(valid_full_names[0])
-        
-        # STEP 4: Fuzzy matching as fallback
+
+            valid_full_names = [
+                name for name in full_names
+                if self.check_entity_in_graph(self.normalize_entity_name(name))
+            ]
+
+            if override_value and any(
+                self.normalize_entity_name(name) == self.normalize_entity_name(override_value)
+                for name in full_names
+            ) and self.check_entity_in_graph(self.normalize_entity_name(override_value)):
+                self.set_replaced_term(entity_name, override_value)
+                return self.normalize_entity_name(override_value)
+
+            if valid_full_names:
+                selected = valid_full_names[0]
+                self.set_replaced_term(entity_name, selected)
+                return self.normalize_entity_name(selected)
+            return None
+
+        # Otherwise treat as full name; try direct match first.
+        if self.check_entity_in_graph(normalized_entity_name):
+            return normalized_entity_name
+
+        # Attempt reverse lookup through alias map (full name -> abbreviation).
+        for abbr, full_names in alias_map.items():
+            normalized_full_names = [self.normalize_entity_name(name) for name in full_names]
+            if normalized_entity_name in normalized_full_names:
+                if self.check_entity_in_graph(abbr):
+                    return abbr
+                for name in full_names:
+                    norm = self.normalize_entity_name(name)
+                    if norm == normalized_entity_name and self.check_entity_in_graph(norm):
+                        self.set_replaced_term(entity_name, name)
+                        return norm
+
+        # Fallback: fuzzy match
         match_name = self.fuzzy_match_entity(normalized_entity_name)
-        
         if match_name:
-            # Ask user to confirm the fuzzy match
-            confirmed_name = self.ask_user(match_name=match_name, original_name=entity_name)
-            if confirmed_name:
-                self.set_replaced_term(entity_name, confirmed_name)
-                return confirmed_name
-        
-        # No match found
+            return match_name
+
         return None
     
     def split_chunks_by_candidate(self, background_chunks: str, group_size: int = 5) -> List[str]:
